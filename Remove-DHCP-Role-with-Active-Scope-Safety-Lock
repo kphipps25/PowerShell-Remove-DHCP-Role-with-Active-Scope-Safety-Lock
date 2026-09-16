@@ -1,0 +1,647 @@
+#requires -Modules ActiveDirectory
+<#
+.SYNOPSIS
+    Removes the DHCP Server role from servers listed in a CSV.
+.DESCRIPTION
+    Safety-focused DHCP removal script.
+    The script:
+      - Reads Domain-DHCP-Audit.csv
+      - Finds servers with DHCP installed
+      - Connects to each server
+      - Re-checks the CURRENT DHCP state (does not trust the old CSV)
+      - Detects active IPv4 DHCP scopes
+      - LOCKS removal if active scopes exist
+      - Allows an explicit per-server override for active scopes
+      - Removes the DHCP Server role
+      - Verifies the role/service was removed
+      - Optionally removes DHCP authorization from AD
+      - Creates an audit CSV
+    IMPORTANT:
+      The CSV is used to identify candidate servers, but the script
+      performs a fresh DHCP scope check immediately before removal.
+.NOTES
+    Recommended:
+      - Run first with $AllowActiveScopeOverride = $false
+      - Keep $AllowReboot = $false
+      - Keep $RemoveDHCPAuthorization = $false
+      - Review the generated results before making AD authorization changes
+#>
+Import-Module ActiveDirectory
+# ============================================================
+# CONFIGURATION
+# ============================================================
+$CSVFile = ".\Domain-DHCP-Audit.csv"
+# ------------------------------------------------------------
+# SAFETY SETTINGS
+# ------------------------------------------------------------
+# NEVER remove a DHCP server that has active scopes unless you
+# explicitly override that server during execution.
+$AllowActiveScopeOverride = $false
+# Do not automatically reboot servers.
+$AllowReboot = $false
+# Leave FALSE initially. This removes DHCP authorization from
+# Active Directory after successful role removal.
+$RemoveDHCPAuthorization = $false
+# Output files
+$RemovalLog = ".\DHCP-Removal-Results.csv"
+$ScopeBackup = ".\DHCP-Scope-Backup.csv"
+# ============================================================
+# HELPER FUNCTION
+# ============================================================
+function Get-RemoteDHCPState {
+    param (
+        [Parameter(Mandatory)]
+        [string]$ComputerName
+    )
+    Invoke-Command `
+        -ComputerName $ComputerName `
+        -ErrorAction Stop `
+        -ScriptBlock {
+            Import-Module DhcpServer -ErrorAction SilentlyContinue
+            # ------------------------------------------------
+            # DHCP role
+            # ------------------------------------------------
+            $Role = Get-WindowsFeature `
+                -Name DHCP `
+                -ErrorAction SilentlyContinue
+            $RoleInstalled = (
+                $Role -and
+                $Role.InstallState -eq "Installed"
+            )
+            # ------------------------------------------------
+            # DHCP service
+            # ------------------------------------------------
+            $Service = Get-Service `
+                -Name DHCPServer `
+                -ErrorAction SilentlyContinue
+            $ServiceInstalled = [bool]$Service
+            $ServiceStatus = if ($Service) {
+                $Service.Status.ToString()
+            }
+            else {
+                "Not Installed"
+            }
+            # ------------------------------------------------
+            # DHCP IPv4 scopes
+            # ------------------------------------------------
+            $Scopes = @()
+            if ($ServiceInstalled) {
+                try {
+                    $Scopes = @(
+                        Get-DhcpServerv4Scope `
+                            -ErrorAction Stop |
+                        Select-Object `
+                            ScopeId,
+                            Name,
+                            State,
+                            StartRange,
+                            EndRange,
+                            SubnetMask
+                    )
+                }
+                catch {
+                    $Scopes = @()
+                }
+            }
+            # ------------------------------------------------
+            # Identify ACTIVE scopes
+            # ------------------------------------------------
+            $ActiveScopes = @(
+                $Scopes |
+                Where-Object {
+                    $_.State -eq "Active"
+                }
+            )
+            [PSCustomObject]@{
+                ComputerName       = $env:COMPUTERNAME
+                RoleInstalled      = $RoleInstalled
+                ServiceInstalled   = $ServiceInstalled
+                ServiceStatus      = $ServiceStatus
+                ScopeCount         = @($Scopes).Count
+                ActiveScopeCount   = @($ActiveScopes).Count
+                Scopes             = $Scopes
+                ActiveScopes       = $ActiveScopes
+            }
+        }
+}
+# ============================================================
+# VERIFY CSV
+# ============================================================
+if (-not (Test-Path $CSVFile)) {
+    Write-Host ""
+    Write-Host "ERROR: CSV file not found:" -ForegroundColor Red
+    Write-Host $CSVFile -ForegroundColor Yellow
+    Write-Host ""
+    exit 1
+}
+# ============================================================
+# IMPORT CSV
+# ============================================================
+Write-Host ""
+Write-Host "Reading DHCP audit CSV..." -ForegroundColor Cyan
+$CSV = Import-Csv $CSVFile
+if (-not $CSV) {
+    Write-Host "CSV contains no records." -ForegroundColor Yellow
+    exit 0
+}
+# ============================================================
+# FIND DHCP SERVERS FROM CSV
+# ============================================================
+$TargetServers = @(
+    $CSV |
+        Where-Object {
+            $_.DHCPRole -eq "Installed" -or
+            $_.DHCPService -eq "Installed"
+        } |
+        Sort-Object Server
+)
+if (-not $TargetServers) {
+    Write-Host ""
+    Write-Host "No DHCP servers found in the CSV." -ForegroundColor Green
+    exit 0
+}
+# ============================================================
+# DISPLAY TARGETS
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" `
+    -ForegroundColor Yellow
+Write-Host "             DHCP REMOVAL CANDIDATES" `
+    -ForegroundColor Yellow
+Write-Host "============================================================" `
+    -ForegroundColor Yellow
+Write-Host ""
+$TargetServers |
+    Format-Table `
+        Server,
+        DHCPRole,
+        DHCPService,
+        ServiceStatus,
+        Authorized,
+        ScopeCount `
+        -AutoSize
+Write-Host ""
+Write-Host "The CSV is only used to identify candidates." `
+    -ForegroundColor Cyan
+Write-Host "Current DHCP state and active scopes will be checked again" `
+    -ForegroundColor Cyan
+Write-Host "before anything is removed." `
+    -ForegroundColor Cyan
+Write-Host ""
+# ============================================================
+# FIRST CONFIRMATION
+# ============================================================
+$Confirmation = Read-Host `
+    "Type REMOVE-DHCP to continue"
+if ($Confirmation -cne "REMOVE-DHCP") {
+    Write-Host ""
+    Write-Host "Operation cancelled. No changes were made." `
+        -ForegroundColor Green
+    exit 0
+}
+# ============================================================
+# PROCESS SERVERS
+# ============================================================
+$Results = foreach ($Target in $TargetServers) {
+    $Server = $Target.Server
+    Write-Host ""
+    Write-Host "============================================================" `
+        -ForegroundColor Cyan
+    Write-Host "Checking: $Server" -ForegroundColor Cyan
+    Write-Host "============================================================" `
+        -ForegroundColor Cyan
+    # --------------------------------------------------------
+    # Connectivity test
+    # --------------------------------------------------------
+    if (-not (Test-Connection `
+        -ComputerName $Server `
+        -Count 1 `
+        -Quiet `
+        -ErrorAction SilentlyContinue)) {
+        Write-Host "LOCKED: Server is unreachable." `
+            -ForegroundColor Red
+        [PSCustomObject]@{
+            Server          = $Server
+            Action          = "LOCKED"
+            Result          = "Unreachable"
+            RoleBefore      = $Target.DHCPRole
+            ServiceBefore   = $Target.DHCPService
+            ServiceStatus   = "Unknown"
+            ScopeCount      = "Unknown"
+            ActiveScopes    = "Unknown"
+            RoleAfter       = "Unknown"
+            ServiceAfter    = "Unknown"
+            Authorization   = $Target.Authorized
+            Notes           = "Server did not respond to ping"
+        }
+        continue
+    }
+    try {
+        # ----------------------------------------------------
+        # Fresh DHCP state check
+        # ----------------------------------------------------
+        Write-Host "Performing fresh DHCP check..." `
+            -ForegroundColor Gray
+        $DHCP = Get-RemoteDHCPState -ComputerName $Server
+        # ----------------------------------------------------
+        # If DHCP is already gone
+        # ----------------------------------------------------
+        if (-not $DHCP.RoleInstalled -and
+            -not $DHCP.ServiceInstalled) {
+            Write-Host "DHCP is already removed." `
+                -ForegroundColor Green
+            [PSCustomObject]@{
+                Server          = $Server
+                Action          = "None"
+                Result          = "Already Removed"
+                RoleBefore      = "Not Installed"
+                ServiceBefore   = "Not Installed"
+                ServiceStatus   = "Not Installed"
+                ScopeCount      = 0
+                ActiveScopes    = 0
+                RoleAfter       = "Not Installed"
+                ServiceAfter    = "Not Installed"
+                Authorization   = $Target.Authorized
+                Notes           = ""
+            }
+            continue
+        }
+        # ----------------------------------------------------
+        # Display current scope information
+        # ----------------------------------------------------
+        Write-Host ""
+        Write-Host "Current DHCP state:" -ForegroundColor White
+        Write-Host "  Role installed:  $($DHCP.RoleInstalled)"
+        Write-Host "  Service:         $($DHCP.ServiceInstalled)"
+        Write-Host "  Service status:  $($DHCP.ServiceStatus)"
+        Write-Host "  Total scopes:    $($DHCP.ScopeCount)"
+        Write-Host "  ACTIVE scopes:   $($DHCP.ActiveScopeCount)"
+        # ----------------------------------------------------
+        # BACK UP SCOPE INFORMATION
+        # ----------------------------------------------------
+        if ($DHCP.ScopeCount -gt 0) {
+            $ScopeBackupRows = foreach ($Scope in $DHCP.Scopes) {
+                [PSCustomObject]@{
+                    Server      = $Server
+                    ScopeId     = $Scope.ScopeId
+                    Name        = $Scope.Name
+                    State       = $Scope.State
+                    StartRange  = $Scope.StartRange
+                    EndRange    = $Scope.EndRange
+                    SubnetMask  = $Scope.SubnetMask
+                }
+            }
+            $ScopeBackupRows |
+                Export-Csv `
+                    -Path $ScopeBackup `
+                    -NoTypeInformation `
+                    -Append `
+                    -Encoding UTF8
+        }
+        # ====================================================
+        # ACTIVE SCOPE SAFETY LOCK
+        # ====================================================
+        if ($DHCP.ActiveScopeCount -gt 0) {
+            Write-Host ""
+            Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
+                -ForegroundColor Red
+            Write-Host "               ACTIVE SCOPE SAFETY LOCK" `
+                -ForegroundColor Red
+            Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" `
+                -ForegroundColor Red
+            Write-Host ""
+            Write-Host "$Server has $($DHCP.ActiveScopeCount) ACTIVE DHCP scope(s)." `
+                -ForegroundColor Red
+            Write-Host ""
+            Write-Host "ACTIVE SCOPES:" -ForegroundColor Yellow
+            $DHCP.ActiveScopes |
+                Format-Table `
+                    ScopeId,
+                    Name,
+                    State,
+                    StartRange,
+                    EndRange `
+                    -AutoSize
+            Write-Host ""
+            Write-Host "DHCP ROLE REMOVAL IS BLOCKED." `
+                -ForegroundColor Red
+            # ------------------------------------------------
+            # Optional explicit override
+            # ------------------------------------------------
+            if ($AllowActiveScopeOverride) {
+                Write-Host ""
+                Write-Host "Override is enabled in the script." `
+                    -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "Removing this DHCP server while active scopes" `
+                    -ForegroundColor Red
+                Write-Host "may cause DHCP outages." `
+                    -ForegroundColor Red
+                Write-Host ""
+                $Override = Read-Host `
+                    "Type REMOVE-ACTIVE-SCOPES-$Server to override"
+                if ($Override -cne "REMOVE-ACTIVE-SCOPES-$Server") {
+                    Write-Host "Server remains LOCKED." `
+                        -ForegroundColor Yellow
+                    [PSCustomObject]@{
+                        Server          = $Server
+                        Action          = "LOCKED"
+                        Result          = "Active Scopes"
+                        RoleBefore      = "Installed"
+                        ServiceBefore   = "Installed"
+                        ServiceStatus   = $DHCP.ServiceStatus
+                        ScopeCount      = $DHCP.ScopeCount
+                        ActiveScopes    = $DHCP.ActiveScopeCount
+                        RoleAfter       = "Installed"
+                        ServiceAfter    = $DHCP.ServiceStatus
+                        Authorization   = $Target.Authorized
+                        Notes           = "Active scope safety lock"
+                    }
+                    continue
+                }
+                Write-Host ""
+                Write-Host "ACTIVE SCOPE OVERRIDE ACCEPTED." `
+                    -ForegroundColor Red
+            }
+            else {
+                [PSCustomObject]@{
+                    Server          = $Server
+                    Action          = "LOCKED"
+                    Result          = "Active Scopes"
+                    RoleBefore      = "Installed"
+                    ServiceBefore   = "Installed"
+                    ServiceStatus   = $DHCP.ServiceStatus
+                    ScopeCount      = $DHCP.ScopeCount
+                    ActiveScopes    = $DHCP.ActiveScopeCount
+                    RoleAfter       = "Installed"
+                    ServiceAfter    = $DHCP.ServiceStatus
+                    Authorization   = $Target.Authorized
+                    Notes           = "Active scope safety lock - removal blocked"
+                }
+                continue
+            }
+        }
+        # ====================================================
+        # SECOND CONFIRMATION
+        # ====================================================
+        Write-Host ""
+        Write-Host "No ACTIVE DHCP scopes detected." `
+            -ForegroundColor Green
+        Write-Host ""
+        Write-Host "READY TO REMOVE DHCP FROM: $Server" `
+            -ForegroundColor Yellow
+        Write-Host "Total scopes: $($DHCP.ScopeCount)"
+        Write-Host "Active scopes: $($DHCP.ActiveScopeCount)"
+        Write-Host ""
+        $ServerConfirmation = Read-Host `
+            "Type REMOVE-$Server to remove DHCP"
+        if ($ServerConfirmation -cne "REMOVE-$Server") {
+            Write-Host "Skipped by operator." `
+                -ForegroundColor Yellow
+            [PSCustomObject]@{
+                Server          = $Server
+                Action          = "Skipped"
+                Result          = "Operator Cancelled"
+                RoleBefore      = "Installed"
+                ServiceBefore   = "Installed"
+                ServiceStatus   = $DHCP.ServiceStatus
+                ScopeCount      = $DHCP.ScopeCount
+                ActiveScopes    = $DHCP.ActiveScopeCount
+                RoleAfter       = "Installed"
+                ServiceAfter    = $DHCP.ServiceStatus
+                Authorization   = $Target.Authorized
+                Notes           = ""
+            }
+            continue
+        }
+        # ====================================================
+        # REMOVE DHCP ROLE
+        # ====================================================
+        Write-Host ""
+        Write-Host "Removing DHCP Server role from $Server..." `
+            -ForegroundColor Yellow
+        $InstallResult = Invoke-Command `
+            -ComputerName $Server `
+            -ErrorAction Stop `
+            -ScriptBlock {
+                Uninstall-WindowsFeature `
+                    -Name DHCP `
+                    -IncludeManagementTools `
+                    -Restart:$using:AllowReboot
+            }
+        # ====================================================
+        # VERIFY REMOVAL
+        # ====================================================
+        Write-Host "Verifying DHCP removal..." `
+            -ForegroundColor Yellow
+        Start-Sleep -Seconds 5
+        $After = Get-RemoteDHCPState `
+            -ComputerName $Server
+        if (-not $After.RoleInstalled -and
+            -not $After.ServiceInstalled) {
+            Write-Host ""
+            Write-Host "SUCCESS: DHCP removed from $Server." `
+                -ForegroundColor Green
+            $Result = "Successfully Removed"
+        }
+        else {
+            Write-Host ""
+            Write-Host "WARNING: DHCP still appears to be installed." `
+                -ForegroundColor Red
+            $Result = "Removal Failed"
+        }
+        [PSCustomObject]@{
+            Server          = $Server
+            Action          = "Remove DHCP"
+            Result          = $Result
+            RoleBefore      = "Installed"
+            ServiceBefore   = "Installed"
+            ServiceStatus   = $DHCP.ServiceStatus
+            ScopeCount      = $DHCP.ScopeCount
+            ActiveScopes    = $DHCP.ActiveScopeCount
+            RoleAfter       = if ($After.RoleInstalled) {
+                "Installed"
+            }
+            else {
+                "Not Installed"
+            }
+            ServiceAfter    = if ($After.ServiceInstalled) {
+                "Installed"
+            }
+            else {
+                "Not Installed"
+            }
+            Authorization   = $Target.Authorized
+            Notes           = if ($InstallResult.RestartNeeded -eq "Yes") {
+                "Restart required"
+            }
+            else {
+                ""
+            }
+        }
+    }
+    catch {
+        Write-Host ""
+        Write-Host "ERROR processing $Server" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        [PSCustomObject]@{
+            Server          = $Server
+            Action          = "Error"
+            Result          = "Error"
+            RoleBefore      = $Target.DHCPRole
+            ServiceBefore   = $Target.DHCPService
+            ServiceStatus   = "Unknown"
+            ScopeCount      = "Unknown"
+            ActiveScopes    = "Unknown"
+            RoleAfter       = "Unknown"
+            ServiceAfter    = "Unknown"
+            Authorization   = $Target.Authorized
+            Notes           = $_.Exception.Message
+        }
+    }
+}
+# ============================================================
+# RESULTS
+# ============================================================
+Write-Host ""
+Write-Host "============================================================" `
+    -ForegroundColor Green
+Write-Host "                    FINAL RESULTS" `
+    -ForegroundColor Green
+Write-Host "============================================================" `
+    -ForegroundColor Green
+Write-Host ""
+$Results |
+    Format-Table `
+        Server,
+        Action,
+        Result,
+        ActiveScopes,
+        RoleAfter,
+        ServiceAfter,
+        Notes `
+        -Wrap -AutoSize
+# ============================================================
+# EXPORT RESULTS
+# ============================================================
+$Results |
+    Export-Csv `
+        -Path $RemovalLog `
+        -NoTypeInformation `
+        -Encoding UTF8
+Write-Host ""
+Write-Host "Removal log:" -ForegroundColor Cyan
+Write-Host "$PWD\$RemovalLog"
+Write-Host ""
+Write-Host "DHCP scope backup:" -ForegroundColor Cyan
+Write-Host "$PWD\$ScopeBackup"
+Write-Host ""
+Write-Host "============================================================" `
+    -ForegroundColor Green
+Write-Host "DHCP removal operation complete." `
+    -ForegroundColor Green
+Write-Host "============================================================" `
+    -ForegroundColor Green
+# ============================================================
+# OPTIONAL AD AUTHORIZATION CLEANUP
+# ============================================================
+if ($RemoveDHCPAuthorization) {
+    Write-Host ""
+    Write-Host "WARNING: AD DHCP authorization cleanup is ENABLED." `
+        -ForegroundColor Red
+    Write-Host ""
+    $AuthConfirmation = Read-Host `
+        "Type REMOVE-DHCP-AUTH to continue"
+    if ($AuthConfirmation -cne "REMOVE-DHCP-AUTH") {
+        Write-Host ""
+        Write-Host "AD authorization cleanup cancelled." `
+            -ForegroundColor Yellow
+    }
+    else {
+        try {
+            $AuthorizedDHCP = Get-DhcpServerInDC `
+                -ErrorAction Stop
+            foreach ($Target in $TargetServers) {
+                $Server = $Target.Server
+                # Only process servers that were successfully removed
+                $RemovalResult = $Results |
+                    Where-Object {
+                        $_.Server -eq $Server
+                    }
+                if ($RemovalResult.Result -ne "Successfully Removed") {
+                    continue
+                }
+                $Authorized = $AuthorizedDHCP |
+                    Where-Object {
+                        $_.DnsName -ieq $Server -or
+                        (
+                            $_.DnsName.Split(".")[0] -ieq
+                            $Server.Split(".")[0]
+                        )
+                    }
+                if ($Authorized) {
+                    Write-Host ""
+                    Write-Host "Removing AD DHCP authorization for $Server..." `
+                        -ForegroundColor Yellow
+                    try {
+                        Remove-DhcpServerInDC `
+                            -DnsName $Authorized.DnsName `
+                            -IPAddress $Authorized.IPAddress `
+                            -ErrorAction Stop
+                        Write-Host "Authorization removed." `
+                            -ForegroundColor Green
+                    }
+                    catch {
+                        Write-Host "Could not remove authorization:" `
+                            -ForegroundColor Red
+                        Write-Host $_.Exception.Message
+                    }
+                }
+                else {
+                    Write-Host ""
+                    Write-Host "$Server is not currently authorized in AD." `
+                        -ForegroundColor Gray
+                }
+            }
+        }
+        catch {
+            Write-Host ""
+            Write-Host "Unable to query DHCP authorization in AD." `
+                -ForegroundColor Red
+            Write-Host $_.Exception.Message
+        }
+    }
+}
+
+How the safety lock works
+
+The important change is that the script doesn’t trust the old CSV’s ScopeCount. Immediately before removing each server, it connects to that server and queries the current DHCP configuration.
+
+If it finds:
+
+Active scopes: 2
+
+you’ll get:
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+               ACTIVE SCOPE SAFETY LOCK
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+DHCP ROLE REMOVAL IS BLOCKED.
+
+and nothing is removed from that server.
+
+It also creates DHCP-Scope-Backup.csv containing the scope information it discovered before any removal.
+
+Recommended production settings
+
+I’d start with these:
+
+$AllowActiveScopeOverride = $false
+$AllowReboot = $false
+$RemoveDHCPAuthorization = $false
+
+That gives you a very conservative workflow:
+
+CSV → fresh check → active scope detection → LOCK if active → explicit per-server confirmation → remove role → verify removal → separate AD authorization cleanup.
+
+One additional safeguard worth considering is having the script refuse to remove a DHCP server if it is the only authorized DHCP server in AD, even when it has no active scopes. That would give you another layer of protection against accidentally removing the last DHCP infrastructure in the environment.
